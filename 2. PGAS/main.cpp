@@ -1,4 +1,4 @@
-#include "mpi.h"
+#include <upcxx/upcxx.hpp>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -19,6 +19,10 @@ void print_matrix(double **matrix, int rows);
 
 void load_matrix_and_init_q(ifstream &file, double **matrixA, double **matrixQ, int rows);
 
+void scatter(double *source, int srows, int scols, int rank, double *target, int recvstart, int count);
+
+void gather(double *source, int rank, double *target, int trows, int tcols, int sendstart, int count);
+
 void set_displs_and_send_counts(int x, int y, int size, int *displs, int *send_counts);
 
 int main(int argc, char *argv[])
@@ -31,12 +35,12 @@ int main(int argc, char *argv[])
     int displs[MAX_PROCESSES], send_counts[MAX_PROCESSES], displs2[MAX_PROCESSES], send_counts2[MAX_PROCESSES];
     clock_t tStart;
 
-    // initialize MPI
-    MPI_Init(&argc, &argv);
+    // initialize UPC++
+    upcxx::init();
     // get current process rank
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    rank = upcxx::rank_me();
     // get total number of processes
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    size = upcxx::rank_n();
 
     if (rank == 0)
     {
@@ -49,7 +53,7 @@ int main(int argc, char *argv[])
         tStart = clock();
     }
     // broadcast the total number of rows to all processes
-    MPI_Bcast((void *)&rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    upcxx::broadcast(&rows, 1, 0).wait();
     // create matrices to store the A and Q matrices
     matrixA = create_matrix(rows, rows);
     matrixQ = create_matrix(rows, rows);
@@ -70,8 +74,8 @@ int main(int argc, char *argv[])
         // create temporary matrix for parallel computation
         mat = create_matrix(tmpLines, rows - i);
         // broadcast the A and Q matrices to all processes
-        MPI_Bcast((void *)&matrixQ[0][0], rows * rows, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast((void *)&matrixA[0][0], rows * rows, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        upcxx::broadcast(&matrixQ[0][0], rows * rows, 0).wait();
+        upcxx::broadcast(&matrixA[0][0], rows * rows, 0).wait();
 
         // set displacement and send counts for the matrix of size (rows-i)x(rows-i)
         set_displs_and_send_counts(rows - i, rows - i, size, displs, send_counts);
@@ -107,8 +111,8 @@ int main(int argc, char *argv[])
             x = sqrt(x);
         }
         // Broadcast x and vec[0] to all processes.
-        MPI_Bcast((void *)&x, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast((void *)&vec[0], rows - i, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        upcxx::broadcast(&x, 1, 0).wait();
+        upcxx::broadcast(&vec[0], rows - i, 0).wait();
         // If x is greater than 0, normalize vec.
         if (x > 0)
         {
@@ -121,7 +125,7 @@ int main(int argc, char *argv[])
                 }
             }
             // Broadcast the normalized vec to all processes.
-            MPI_Bcast((void *)&vec[0], rows - i, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            upcxx::broadcast(&vec[0], rows - i, 0).wait();
 
             // Construct the matrix P.
             // If i > 0 and i < rows - size, delete the previous version of P.
@@ -129,8 +133,8 @@ int main(int argc, char *argv[])
                 delete_matrix(p, rows - i);
             p = create_matrix(rows - i, rows - i);
             // Scatter the rows of P to all processes.
-            MPI_Scatterv(&p[0][0], send_counts, displs, MPI_DOUBLE, &mat[0][0], tmpLines * (rows - i), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            
+            scatter(&p[0][0], rows - i, rows - i, rank, &mat[0][0], displs[rank], tmpLines * (rows - i));
+            upcxx::barrier();
             // Compute the values of P for the assigned rows of mat.
             for (int k = 0; k < send_counts[rank] / (rows - i); k++)
             {
@@ -143,10 +147,10 @@ int main(int argc, char *argv[])
                 }
             }
             // Gather the rows of P computed by each process to the root process.
-            MPI_Gatherv(&mat[0][0], send_counts[rank], MPI_DOUBLE, &p[0][0], send_counts, displs, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            gather(&mat[0][0], rank, &p[0][0], rows - i, rows - i, displs[rank], send_counts[rank]);
+            upcxx::barrier();
             // Broadcast the entire matrix P to all processes.
-            MPI_Bcast((void *)&p[0][0], (rows - i) * (rows - i), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
+            upcxx::broadcast(&p[0][0], (rows - i) * (rows - i), 0).wait();
 
             // Multiply the assigned rows of matrix A by the assigned rows of P.
             // Store the result in mat. (parellel)
@@ -167,11 +171,12 @@ int main(int argc, char *argv[])
                 delete_matrix(matTmp, rows - i);
 
             // Create a temporary matrix to hold data from a portion of the original matrix
-            // to be processed by each MPI process.    
+            // to be processed by each process.    
             matTmp = create_matrix(rows - i, rows - i);
             // Gather data from the original matrix into matTmp, using send_counts and displs
             // arrays to specify the portion of data to be sent by each process.
-            MPI_Gatherv(&mat[0][0], send_counts[rank], MPI_DOUBLE, &matTmp[0][0], send_counts, displs, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            gather(&mat[0][0], rank, &matTmp[0][0], rows - i, rows - i, displs[rank], send_counts[rank]);
+            upcxx::barrier();
             // If the current process is the root process (rank 0), copy the data from matTmp back
             // into the appropriate portion of the original matrix.
             if (rank == 0)
@@ -221,7 +226,8 @@ int main(int argc, char *argv[])
             matTmp = create_matrix(rows, rows - i);
             // Gather data from the temporary matrix into matTmp, using send_counts2 and displs2
             // arrays to specify the portion of data to be sent by each process.
-            MPI_Gatherv(&mat[0][0], send_counts2[rank], MPI_DOUBLE, &matTmp[0][0], send_counts2, displs2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            gather(&mat[0][0], rank, &matTmp[0][0], rows, rows - i, displs2[rank], send_counts2[rank]);
+            upcxx::barrier();
             
             // If this process has rank 0, then loop copies the data from matTmp back to the original matrixQ
             // by offsetting the column index by i.
@@ -248,9 +254,9 @@ int main(int argc, char *argv[])
         cout.precision(6);  
         cout << "\nExecution time: " << (double)(clock() - tStart)/CLOCKS_PER_SEC << "s\n";
     }
-    // Close the input file and finalize MPI
+    // Close the input file and finalize UPC++
     file.close();
-    MPI_Finalize();
+    upcxx::finalize();
     return 0;
 }
 
@@ -267,7 +273,7 @@ ifstream process_cmd_arguments(int argc, char *argv[])
     if (argc != 2)
     {
         cout << "Please provide input file as a single argument." << endl;
-        MPI_Finalize();
+        upcxx::finalize();
         exit(1);
     }
     else
@@ -279,7 +285,7 @@ ifstream process_cmd_arguments(int argc, char *argv[])
         else
         {
             cout << "Cannot open file." << endl;
-            MPI_Finalize();
+            upcxx::finalize();
             exit(1);
         }
     }
@@ -361,7 +367,7 @@ void load_matrix_and_init_q(ifstream &file, double **matrixA, double **matrixQ, 
  * Sets the displacement and send counts arrays
  * @param x: number of rows in matrix
  * @param y: number of columns in matrix
- * @param size: number of MPI processes
+ * @param size: number of UPC++ processes
  * @param displs: array of displacements (output parameter)
  * @param send_counts: array of send counts (output parameter)
  */
@@ -379,5 +385,96 @@ void set_displs_and_send_counts(int x, int y, int size, int *displs, int *send_c
         }
         displs[size - 1] = displs[size - 2] + part;           // set the displacement for the last process
         send_counts[size - 1] = ((x * y) - displs[size - 1]); // set the send count for the last process
+    }
+}
+
+/**
+ * Scatter function scatters data from the source array to the target array using UPC++.
+ *
+ * @param source The pointer to the source array.
+ * @param srows The number of rows in the source array.
+ * @param scols The number of columns in the source array.
+ * @param rank The rank of the current process.
+ * @param target The pointer to the target array.
+ * @param recvstart The starting index in the target array where data should be received.
+ * @param count The number of elements to be scattered from the source array to the target array.
+ */
+void scatter(double *source, int srows, int scols, int rank, double *target, int recvstart, int count)
+{
+    // Declare a global pointer to store the distributed data
+    upcxx::global_ptr<double> matrix;
+
+    if (rank == 0)
+    {
+        // Allocate a new array to store the data on rank 0
+        matrix = upcxx::new_array<double>(srows * scols);
+        
+        // Get the local pointer to the matrix data
+        double *local_matrix = matrix.local();
+
+        // Copy the data from the source array to the local_matrix
+        for (int i = 0; i < srows * scols; i++) {
+            local_matrix[i] = *(source + i);
+        }
+    }
+
+    // Broadcast the matrix pointer to all ranks
+    matrix = upcxx::broadcast(matrix, 0).wait();
+
+    // Scatter the data from the source array to the target array
+    for (int i = 0; i < count; i++)
+        *(target + i) = rank ? upcxx::rget(matrix + recvstart + i).wait() : *(source + (recvstart + i));
+}
+
+
+/**
+ * @brief Gather function gathers data from the source array and stores it in the target array using UPC++.
+ *
+ * @param source The pointer to the source array.
+ * @param rank The rank of the current process.
+ * @param target The pointer to the target array.
+ * @param trows The number of rows in the target array.
+ * @param tcols The number of columns in the target array.
+ * @param sendstart The starting index in the target array where data should be sent.
+ * @param count The number of elements to be gathered from the source array to the target array.
+ */
+void gather(double *source, int rank, double *target, int trows, int tcols, int sendstart, int count)
+{
+    // Declare a global pointer to store the distributed data
+    upcxx::global_ptr<double> matrix;
+
+    if (rank == 0)
+    {
+        // Allocate a new array on rank 0 to store the gathered data
+        matrix = upcxx::new_array<double>(trows * tcols);
+    }
+
+    // Broadcast the matrix pointer to all ranks
+    matrix = upcxx::broadcast(matrix, 0).wait();
+
+    if (rank == 0)
+    {
+        // Copy data from the source array to the target array on rank 0
+        for (int i = 0; i < count; i++)
+            *(target + (sendstart + i)) = *(source + i);
+    }
+    else
+    {
+        // Put data from the source array into the matrix on other ranks
+        for (int i = 0; i < count; i++)
+            upcxx::rput(*(source + i), matrix + sendstart + i).wait();
+    }
+
+    // Synchronize all ranks
+    upcxx::barrier();
+
+    if (rank == 0)
+    {
+        // Get the local pointer to the matrix data on rank 0
+        double *local_matrix = matrix.local();
+
+        // Copy the remaining data from the matrix to the target array on rank 0
+        for (int i = count; i < trows * tcols; i++)
+            *(target + (sendstart + i)) = local_matrix[i];
     }
 }
